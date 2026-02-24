@@ -1,7 +1,6 @@
 import torch
 import torch.distributed as dist
 from torch.autograd import Function
-from torch.distributed.nn.functional import all_gather
 
 _SP_GROUP = None
 
@@ -20,10 +19,16 @@ class _AllReduce(Function):
 
 @torch._dynamo.allow_in_graph
 def sp_all_reduce(tensor, op=dist.ReduceOp.SUM):
+    if _SP_GROUP is None:
+        return tensor
     return _AllReduce.apply(op, _SP_GROUP, tensor)
 
 def init_sp_group(sp_size):
     global _SP_GROUP
+
+    if not dist.is_initialized():
+        _SP_GROUP = None
+        return
 
     assert dist.get_world_size() % sp_size == 0, f"world size {dist.get_world_size()} is not divisible by sp size {sp_size}"
 
@@ -34,18 +39,29 @@ def is_sp():
     return _SP_GROUP is not None
 
 def get_sp_rank():
+    if _SP_GROUP is None:
+        return 0
     return dist.get_rank(_SP_GROUP)
 
 def get_sp_world_size():
+    if _SP_GROUP is None:
+        return 1
     return dist.get_world_size(_SP_GROUP)
 
 def get_sp_replicas():
+    if _SP_GROUP is None:
+        return 1
     return dist.get_world_size() // get_sp_world_size()
 
 def get_sp_replica_id():
+    if _SP_GROUP is None:
+        return 0
     return dist.get_rank() // get_sp_world_size()
 
 def sp_broadcast_different_size(x: torch.Tensor):
+    if _SP_GROUP is None:
+        return x, tuple(x.shape)
+
     # Get the source global rank for the broadcast
     src_rank = dist.get_global_rank(_SP_GROUP, 0)
 
@@ -67,6 +83,9 @@ def sp_broadcast_different_size(x: torch.Tensor):
     return x, new_shape
 
 def sp_broadcast(x: torch.Tensor):
+    if _SP_GROUP is None:
+        return x
+
     if dist.get_rank(_SP_GROUP) != 0:
         pass
 
@@ -94,6 +113,10 @@ def pad0_tensor(x, dim, pad_len):
     return torch.cat([x, pad_tensor], dim=dim)
 
 def gather_scatter(x, gather_dim=2, scatter_dim=1, process_group=None):
+    if process_group is None:
+        return x
+
+    from torch.distributed.nn.functional import all_gather
     # [b, N, s, d]
     all_x = all_gather(x, group=process_group)
     local_rank = process_group.rank()
@@ -116,10 +139,15 @@ def gather_scatter(x, gather_dim=2, scatter_dim=1, process_group=None):
 
 
 def sp_gather_scatter(x, gather_dim=2, scatter_dim=1):
+    if _SP_GROUP is None:
+        return x
     return gather_scatter(x, gather_dim=gather_dim, scatter_dim=scatter_dim, process_group=_SP_GROUP)
 
 
 def local_scatter(x, scatter_dim=1, process_group=None):
+    if process_group is None:
+        return x
+
     local_rank = process_group.rank()
 
     scatter_size = process_group.size()
@@ -134,6 +162,8 @@ def local_scatter(x, scatter_dim=1, process_group=None):
 
 
 def sp_local_scatter(x, scatter_dim=1):
+    if _SP_GROUP is None:
+        return x
     return local_scatter(x, scatter_dim=scatter_dim, process_group=_SP_GROUP)
 
 
@@ -143,6 +173,11 @@ def sp_input_broadcast_scatter(x, scatter_dim=1, different_size=False):
         1. need all rank have the same size and type of x.
         2. it will auto-pad and shard among the scatter_dim given the sp world size.
     """
+    if _SP_GROUP is None:
+        if different_size:
+            return x, tuple(x.shape)
+        return x
+
     if different_size:
         # [b, n, s, d]
         x, new_shape = sp_broadcast_different_size(x)
@@ -170,6 +205,12 @@ def sp_all_gather(x, gather_dim=2, length=-1):
     Note:
         1. need all rank have the same size and type of x.
     """
+    if _SP_GROUP is None:
+        if length != -1:
+            x = slice_tensor(x, gather_dim, 0, length)
+        return x
+
+    from torch.distributed.nn.functional import all_gather
 
     # [b, n, S, d]
     x = all_gather(x, group=_SP_GROUP)      # list of x's
